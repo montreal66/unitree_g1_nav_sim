@@ -9,13 +9,17 @@ Reference: https://github.com/unitreerobotics/unitree_ros
 """
 
 import os
+from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.utils import configclass
 
-UNITREE_MODEL_DIR = "/home/sustech/桌面/unitree_locomotion_cb/unitree_model"
+# The model assets are kept alongside this project in the Isaac stack.  Keep
+# the location overridable for installations that store the asset pack elsewhere.
+_DEFAULT_UNITREE_MODEL_DIR = Path(__file__).resolve().parents[6] / "unitree_rl_lab" / "unitree_model"
+UNITREE_MODEL_DIR = os.environ.get("UNITREE_MODEL_DIR", str(_DEFAULT_UNITREE_MODEL_DIR))
 UNITREE_ROS_DIR = "path/to/unitree_ros"  # Replace with the actual path to your unitree_ros package
 
 
