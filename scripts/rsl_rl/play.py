@@ -112,7 +112,6 @@ from isaaclab_rl.rsl_rl import (
     RslRlVecEnvWrapper,
     export_policy_as_jit,
     export_policy_as_onnx,
-    handle_deprecated_rsl_rl_cfg,
 )
 from isaaclab_tasks.utils import get_checkpoint_path
 
@@ -157,8 +156,6 @@ def main():
     if args_cli.camera_lookat is not None:
         env_cfg.viewer.lookat = tuple(args_cli.camera_lookat)
     agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
-    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
