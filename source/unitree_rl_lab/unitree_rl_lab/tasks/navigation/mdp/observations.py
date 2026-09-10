@@ -64,3 +64,31 @@ def height_scan_pooled(
     pooled_grid = F.max_pool2d(height_grid, kernel_size=pool_size, stride=pool_size)
     return pooled_grid.flatten(start_dim=1)
     # <<< HOMEWORK_TODO_2_END
+
+
+def height_scan_pooled_legacy_positive(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    pool_size: int = 2,
+) -> torch.Tensor:
+    """Legacy V5 kinematic scan: local hit height above the flat ground.
+
+    This intentionally differs from :func:`height_scan_pooled`.  It is only for
+    replaying checkpoints trained by the 2026-09-10 kinematic implementation,
+    whose scan used ``0`` for ground and positive obstacle-top heights.  The
+    regular G1 navigation tasks must continue to use the physical, signed scan.
+    """
+    sensor = env.scene.sensors[sensor_cfg.name]
+    # The V5 ground is locally flat at each environment origin.  Using raw hit
+    # z reproduces the old synthetic map: ground -> 0, low box -> 0.6, and a
+    # 2 m obstacle -> 1.5 after clipping.
+    hit_height = sensor.data.ray_hits_w[..., 2] - env.scene.env_origins[:, 2].unsqueeze(1)
+    hit_height = torch.nan_to_num(hit_height, nan=0.0, posinf=0.0, neginf=0.0).clamp_(0.0, 1.5)
+    ny, nx = _height_scan_grid_shape(env, sensor_cfg)
+    if hit_height.shape[1] != ny * nx:
+        raise RuntimeError(
+            f"Height scan has {hit_height.shape[1]} rays, but its configured grid shape is ({ny}, {nx})."
+        )
+    return F.max_pool2d(hit_height.reshape(env.num_envs, 1, ny, nx), kernel_size=pool_size, stride=pool_size).flatten(
+        start_dim=1
+    )

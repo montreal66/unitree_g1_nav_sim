@@ -747,6 +747,33 @@ class NavigationV5CompactObservationsCfg_NoLowLevelState(NavigationV5CompactObse
 
 
 @configclass
+class NavigationV5CompactObservationsCfg_NoLowLevelState_LegacyPositiveScan(
+    NavigationV5CompactObservationsCfg_NoLowLevelState
+):
+    """Planner-only observations for checkpoints trained with positive height maps.
+
+    This is intentionally a replay-compatibility configuration. New policies
+    should use ``NavigationV5CompactObservationsCfg_NoLowLevelState`` instead.
+    """
+
+    @configclass
+    class PolicyCfg(NavigationV5CompactObservationsCfg_NoLowLevelState.PolicyCfg):
+        height_scan_pooled = ObsTerm(
+            func=mdp.height_scan_pooled_legacy_positive,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner"), "pool_size": 2},
+            clip=(0.0, 1.5),
+        )
+
+    @configclass
+    class CriticCfg(PolicyCfg):
+        base_height = ObsTerm(func=mdp.base_pos_z)
+        command_distance = ObsTerm(func=mdp.command_distance, params={"command_name": "pose_command"})
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
 class NavigationTerminationsCfg:
     """Episode ends on timeout, success, or low-level stability failure."""
 
@@ -924,6 +951,17 @@ class NavigationV5MixedObstacleEnvCfg_Compact_SingleGoal_NoLowLevelState(
 
 
 @configclass
+class NavigationV5MixedObstacleEnvCfg_Compact_SingleGoal_NoLowLevelState_LegacyPositiveScan(
+    NavigationV5MixedObstacleEnvCfg_Compact_SingleGoal_NoLowLevelState
+):
+    """Real-G1 replay environment for legacy positive-height-map planners."""
+
+    observations: NavigationV5CompactObservationsCfg_NoLowLevelState_LegacyPositiveScan = (
+        NavigationV5CompactObservationsCfg_NoLowLevelState_LegacyPositiveScan()
+    )
+
+
+@configclass
 class NavigationV5MixedObstacleEnvCfg_PLAY(NavigationV5MixedObstacleEnvCfg):
     viewer: ViewerCfg = ViewerCfg(
         eye=(-3.5, 0.0, 2.0),
@@ -1021,4 +1059,15 @@ class NavigationV5MixedObstacleEnvCfg_Compact_SingleGoal_NoLowLevelState_PLAY(
 
     observations: NavigationV5CompactObservationsCfg_NoLowLevelState = (
         NavigationV5CompactObservationsCfg_NoLowLevelState()
+    )
+
+
+@configclass
+class NavigationV5MixedObstacleEnvCfg_Compact_SingleGoal_NoLowLevelState_LegacyPositiveScan_PLAY(
+    NavigationV5MixedObstacleEnvCfg_Compact_SingleGoal_NoLowLevelState_PLAY
+):
+    """Play configuration for legacy positive-height-map checkpoints only."""
+
+    observations: NavigationV5CompactObservationsCfg_NoLowLevelState_LegacyPositiveScan = (
+        NavigationV5CompactObservationsCfg_NoLowLevelState_LegacyPositiveScan()
     )
