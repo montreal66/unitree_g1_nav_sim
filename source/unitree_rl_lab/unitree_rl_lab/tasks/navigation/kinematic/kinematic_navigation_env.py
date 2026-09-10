@@ -91,7 +91,15 @@ class KinematicNavigationEnv(DirectRLEnv):
 
         self._episode_sums = {
             name: torch.zeros(self.num_envs, device=self.device)
-            for name in ("position_progress", "position_tracking", "success", "obstacle_soft_zone", "action_rate", "action_magnitude")
+            for name in (
+                "termination_penalty",
+                "position_progress",
+                "position_tracking",
+                "success",
+                "obstacle_soft_zone",
+                "action_rate",
+                "action_magnitude",
+            )
         }
 
     def _setup_scene(self):
@@ -244,9 +252,15 @@ class KinematicNavigationEnv(DirectRLEnv):
         position_tracking = 1.0 - torch.tanh(distance / 0.1)
         success = (distance < self.cfg.goal_success_radius).float()
         obstacle_soft_zone = self._obstacle_soft_penalty(self._position_xy)
+        obstacle_collision = (
+            self._nearest_obstacle_surface_distance(self._position_xy) <= self.cfg.obstacle_termination_distance
+        ).float()
         action_rate = torch.sum((self._actions - self._last_actions).square(), dim=1)
         action_magnitude = torch.sum(self._actions.square(), dim=1)
         rewards = {
+            # Match the physical task's fall termination penalty. The terminal
+            # collision is detected on the same transition in _get_dones.
+            "termination_penalty": -400.0 * obstacle_collision,
             "position_progress": 2.0 * progress,
             "position_tracking": 0.5 * position_tracking,
             "success": 50.0 * success,
