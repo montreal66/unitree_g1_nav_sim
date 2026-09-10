@@ -1,11 +1,8 @@
-"""Ideal planar tracker for transfer-compatible navigation-policy training.
+"""Robot-free navigation with an ideal body-frame velocity tracker.
 
-The policy acts in the same velocity-command space as the physical G1 navigation
-task.  Here the command is tracked perfectly in the body frame, so locomotion is
-removed from the learning problem.  Goal sampling, pooled local obstacle map,
-reward weights, termination radius, and action bounds match the V5 compact
-single-goal task.  A checkpoint from this environment can be played with
-``Unitree-G1-29dof-Navigation-HRL-Baseline-NoLowLevelState``.
+This is the compact ablation used in the earlier experiments: it keeps the
+V5-sized pooled local height map and the high-level observation layout, while
+removing the G1 articulation and frozen low-level policy.
 """
 
 from __future__ import annotations
@@ -21,283 +18,268 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 
-from unitree_rl_lab.tasks.navigation.mdp.obstacles.mixed_arena_templates import (
-    get_fixed_mixed_arena_template,
-    num_fixed_mixed_arena_templates,
-)
-from unitree_rl_lab.tasks.navigation.mdp.obstacles.mixed_obstacle_layout import (
-    MixedObstacleLayoutCfg,
-    ObstacleSlotType,
-    _build_slot_metadata,
-)
-from unitree_rl_lab.tasks.navigation.mdp.obstacles.mixed_obstacle_collection import V5_MAX_MIXED_OBSTACLES
+
+def _wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 
 @configclass
 class KinematicNavigationEnvCfg(DirectRLEnvCfg):
-    """Configuration matching V5 compact single-goal navigation at the planner boundary."""
+    """Point tracker in a random circular-obstacle field."""
 
-    episode_length_s = 30.0
-    decimation = 10
+    # The real G1 high-level controller acts every 0.2 s (5 Hz).
+    decimation = 1
+    episode_length_s = 20.0
     action_space = 3
-    # policy: v_base (3), w_base (3), gravity (3), goal (4), last command (3), pooled map (273)
+    # 3 base velocity + 3 base angular velocity + 3 gravity + 4 goal command
+    # + 3 previous action + 21 x 13 pooled height map.
     observation_space = 289
-    # critic adds base height and goal distance.
     state_space = 291
-    sim: SimulationCfg = SimulationCfg(dt=0.02, render_interval=decimation)
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=1.0)
+    sim: SimulationCfg = SimulationCfg(dt=0.2, render_interval=1)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=4096, env_spacing=24.0, replicate_physics=False, clone_in_fabric=False
+    )
     ui_window_class_type = None
 
-    goal_distance_range = (5.0, 10.0)
-    goal_success_radius = 0.5
-    velocity_clip = ((-0.5, 1.0), (-0.5, 0.5), (-0.5, 0.5))
-    base_height = 0.78
+    arena_half_extent = 10.0
+    arena_margin = 0.5
+    num_obstacles = 16
+    obstacle_radius = 0.55
+    tracker_radius = 0.30
+    # Surface-to-footprint free-space margin at collision. Kept at the current
+    # requested value; the older 0.5 m experiment is intentionally not restored.
+    termination_clearance = 0.10
+
+    # V5 compact map layout: 42 x 26 rays -> 21 x 13 after 2x2 max pooling.
     height_scan_size = (5.0, 3.0)
-    height_scan_shape = (26, 42)
-    obstacle_soft_margin = 0.4
-    obstacle_termination_distance = 0.1
+    height_scan_resolution = 0.12
+    tracker_height = 0.8
+    obstacle_height = 2.0
+    height_scan_offset = 0.5
+
+    goal_distance_range = (4.0, 8.0)
+    goal_radius = 0.50
+    # Original V5 soft shell, measured from obstacle surface to tracker root.
+    obstacle_soft_margin = 0.40
+    velocity_lower = (-0.5, -0.5, -0.5)
+    velocity_upper = (1.0, 0.5, 0.5)
 
 
 @configclass
 class KinematicNavigationEnvCfg_PLAY(KinematicNavigationEnvCfg):
-    """Small deterministic configuration for checkpoint inspection."""
-
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=16, env_spacing=1.0)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=16, env_spacing=24.0, replicate_physics=False, clone_in_fabric=False
+    )
 
 
 class KinematicNavigationEnv(DirectRLEnv):
-    """Vectorized ideal body-frame velocity tracker with V5 navigation rewards."""
+    """Tensor-only ideal tracker with the compact planner observation interface."""
 
     cfg: KinematicNavigationEnvCfg
 
     def __init__(self, cfg: KinematicNavigationEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
 
-        self._actions = torch.zeros(self.num_envs, 3, device=self.device)
-        self._last_actions = torch.zeros_like(self._actions)
-        self._position_xy = torch.zeros(self.num_envs, 2, device=self.device)
+        self._position = torch.zeros(self.num_envs, 2, device=self.device)
         self._heading = torch.zeros(self.num_envs, device=self.device)
-        self._body_velocity = torch.zeros(self.num_envs, 3, device=self.device)
-        self._goal_xy = torch.zeros(self.num_envs, 2, device=self.device)
-        self._goal_heading = torch.zeros(self.num_envs, device=self.device)
+        self._goal = torch.zeros(self.num_envs, 2, device=self.device)
+        self._obstacles = torch.zeros(self.num_envs, self.cfg.num_obstacles, 2, device=self.device)
+        self._last_action = torch.zeros(self.num_envs, 3, device=self.device)
+        self._raw_action = torch.zeros_like(self._last_action)
+        self._command = torch.zeros_like(self._last_action)
         self._previous_distance = torch.zeros(self.num_envs, device=self.device)
+        self._distance = torch.zeros(self.num_envs, device=self.device)
+        self._nearest_obstacle_clearance = torch.zeros(self.num_envs, device=self.device)
+        self._success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._collision = torch.zeros_like(self._success)
+        self._out_of_bounds = torch.zeros_like(self._success)
 
-        self._scan_points_b = self._make_scan_points()
-        self._slot_type, self._footprint_radius, self._half_extents_xy, self._obstacle_heights = _build_slot_metadata(
-            self.device
+        # Match Isaac Lab GridPatternCfg: x has 42 samples (-2.5 ... 2.42),
+        # y has 26 samples (-1.5 ... 1.5).
+        x = torch.arange(
+            -self.cfg.height_scan_size[0] / 2,
+            self.cfg.height_scan_size[0] / 2 + 1.0e-9,
+            self.cfg.height_scan_resolution,
+            device=self.device,
         )
-        self._template_centers, self._template_slots, self._template_active = self._load_templates()
-        self._template_id = torch.arange(self.num_envs, device=self.device) % num_fixed_mixed_arena_templates()
-
-        self._episode_sums = {
-            name: torch.zeros(self.num_envs, device=self.device)
-            for name in (
-                "termination_penalty",
-                "position_progress",
-                "position_tracking",
-                "success",
-                "obstacle_soft_zone",
-                "action_rate",
-                "action_magnitude",
-            )
-        }
+        y = torch.arange(
+            -self.cfg.height_scan_size[1] / 2,
+            self.cfg.height_scan_size[1] / 2 + 1.0e-9,
+            self.cfg.height_scan_resolution,
+            device=self.device,
+        )
+        grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+        self._height_grid_points_b = torch.stack((grid_x, grid_y), dim=-1)
+        if self._height_grid_points_b.shape[:2] != (26, 42):
+            raise RuntimeError("The ideal height-map grid must match the V5 42 x 26 ray layout.")
+        self._height_scan_ground = self.cfg.tracker_height - self.cfg.height_scan_offset
+        self._height_scan_obstacle = max(
+            -1.5, self.cfg.tracker_height - self.cfg.obstacle_height - self.cfg.height_scan_offset
+        )
+        self._velocity_lower = torch.tensor(self.cfg.velocity_lower, device=self.device)
+        self._velocity_upper = torch.tensor(self.cfg.velocity_upper, device=self.device)
 
     def _setup_scene(self):
-        # This environment owns only tensor state.  DirectRLEnv still provides the
-        # standard vectorized stepping, reset, logging, and RSL-RL interface.
+        # No USD robot or obstacle prims are required: all state is analytic.
         pass
 
-    def _make_scan_points(self) -> torch.Tensor:
-        ny, nx = self.cfg.height_scan_shape
-        x = torch.linspace(-self.cfg.height_scan_size[0] / 2, self.cfg.height_scan_size[0] / 2, nx, device=self.device)
-        y = torch.linspace(-self.cfg.height_scan_size[1] / 2, self.cfg.height_scan_size[1] / 2, ny, device=self.device)
-        yy, xx = torch.meshgrid(y, x, indexing="ij")
-        return torch.stack((xx, yy), dim=-1).reshape(-1, 2)
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        # Same raw high-level action convention as PreTrainedPolicyAction.
+        self._raw_action.copy_(actions)
+        self._command = torch.clamp(self._raw_action, min=self._velocity_lower, max=self._velocity_upper)
 
-    def _load_templates(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        template_count = num_fixed_mixed_arena_templates()
-        centers = torch.zeros(template_count, V5_MAX_MIXED_OBSTACLES, 2, device=self.device)
-        slots = torch.full((template_count, V5_MAX_MIXED_OBSTACLES), -1, dtype=torch.long, device=self.device)
-        active = torch.zeros(template_count, V5_MAX_MIXED_OBSTACLES, dtype=torch.bool, device=self.device)
-        for template_id in range(template_count):
-            template = get_fixed_mixed_arena_template(template_id, layout_cfg=MixedObstacleLayoutCfg())
-            count = template.num_active
-            centers[template_id, :count] = template.centers_xy[:count].to(self.device)
-            slots[template_id, :count] = template.active_slot_ids[:count].to(self.device)
-            active[template_id, :count] = True
-        return centers, slots, active
-
-    @staticmethod
-    def _wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
-        return torch.atan2(torch.sin(angle), torch.cos(angle))
-
-    def _template_data(self, env_ids: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        ids = self._template_id if env_ids is None else self._template_id[env_ids]
-        return self._template_centers[ids], self._template_slots[ids], self._template_active[ids]
-
-    def _nearest_obstacle_surface_distance(
-        self, query_xy: torch.Tensor, env_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """Distance from the base projection to the nearest active obstacle surface."""
-        centers, slot_ids, active = self._template_data(env_ids)
-        safe_slots = slot_ids.clamp_min(0)
-        delta = query_xy.unsqueeze(1) - centers
-        footprint = self._footprint_radius[safe_slots]
-        half_extents = self._half_extents_xy[safe_slots]
-        is_cylinder = self._slot_type[safe_slots] == ObstacleSlotType.CYLINDER
-        cylinder_distance = torch.linalg.norm(delta, dim=-1) - footprint
-        dx = torch.relu(torch.abs(delta[..., 0]) - half_extents[..., 0])
-        dy = torch.relu(torch.abs(delta[..., 1]) - half_extents[..., 1])
-        box_distance = torch.sqrt(dx.square() + dy.square())
-        surface_distance = torch.where(is_cylinder, cylinder_distance, box_distance)
-        return torch.where(active, surface_distance, torch.inf).amin(dim=1)
-
-    def _obstacle_soft_penalty(self, query_xy: torch.Tensor, env_ids: torch.Tensor | None = None) -> torch.Tensor:
-        """Match the physical task's soft-zone penalty exactly."""
-        surface_distance = self._nearest_obstacle_surface_distance(query_xy, env_ids)
-        normalized = torch.clamp(1.0 - surface_distance / self.cfg.obstacle_soft_margin, min=0.0, max=1.0).square()
-        return normalized
-
-    def _is_goal_free(self, goal_xy: torch.Tensor, env_ids: torch.Tensor) -> torch.Tensor:
-        centers, slot_ids, active = self._template_data(env_ids)
-        safe_slots = slot_ids.clamp_min(0)
-        delta = goal_xy.unsqueeze(1) - centers
-        footprint = self._footprint_radius[safe_slots]
-        half_extents = self._half_extents_xy[safe_slots]
-        is_cylinder = self._slot_type[safe_slots] == ObstacleSlotType.CYLINDER
-        cylinder_distance = torch.linalg.norm(delta, dim=-1) - footprint
-        dx = torch.relu(torch.abs(delta[..., 0]) - half_extents[..., 0])
-        dy = torch.relu(torch.abs(delta[..., 1]) - half_extents[..., 1])
-        box_distance = torch.sqrt(dx.square() + dy.square())
-        surface_distance = torch.where(is_cylinder, cylinder_distance, box_distance)
-        required_clearance = self.cfg.goal_success_radius + self.cfg.obstacle_soft_margin
-        return ~torch.any((surface_distance < required_clearance) & active, dim=1)
-
-    def _sample_goals(self, env_ids: torch.Tensor):
-        count = len(env_ids)
-        angle = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
-        distance = torch.empty(count, device=self.device).uniform_(*self.cfg.goal_distance_range)
-        candidate = self._position_xy[env_ids] + torch.stack((torch.cos(angle), torch.sin(angle)), dim=1) * distance.unsqueeze(1)
-        for _ in range(128):
-            invalid = ~self._is_goal_free(candidate, env_ids)
-            if not bool(torch.any(invalid)):
-                break
-            invalid_count = int(invalid.sum().item())
-            angle[invalid] = torch.empty(invalid_count, device=self.device).uniform_(-math.pi, math.pi)
-            distance[invalid] = torch.empty(invalid_count, device=self.device).uniform_(*self.cfg.goal_distance_range)
-            candidate[invalid] = self._position_xy[env_ids][invalid] + torch.stack(
-                (torch.cos(angle[invalid]), torch.sin(angle[invalid])), dim=1
-            ) * distance[invalid].unsqueeze(1)
-        self._goal_xy[env_ids] = candidate
-        self._goal_heading[env_ids] = torch.atan2(candidate[:, 1] - self._position_xy[env_ids, 1], candidate[:, 0] - self._position_xy[env_ids, 0])
-
-    def _goal_command(self) -> torch.Tensor:
-        delta = self._goal_xy - self._position_xy
+    def _apply_action(self) -> None:
+        # Perfect velocity tracking; yaw is applied first, matching the earlier
+        # ideal-tracker experiment exactly.
+        self._heading = _wrap_to_pi(self._heading + self._command[:, 2] * self.physics_dt)
         cos_heading = torch.cos(self._heading)
         sin_heading = torch.sin(self._heading)
-        goal_x_b = cos_heading * delta[:, 0] + sin_heading * delta[:, 1]
-        goal_y_b = -sin_heading * delta[:, 0] + cos_heading * delta[:, 1]
-        goal_heading_b = self._wrap_to_pi(self._goal_heading - self._heading)
-        return torch.stack((goal_x_b, goal_y_b, torch.zeros_like(goal_x_b), goal_heading_b), dim=1)
-
-    def _pooled_height_scan(self) -> torch.Tensor:
-        points_b = self._scan_points_b.unsqueeze(0).expand(self.num_envs, -1, -1)
-        cos_heading = torch.cos(self._heading).unsqueeze(1)
-        sin_heading = torch.sin(self._heading).unsqueeze(1)
-        points_w = torch.empty_like(points_b)
-        points_w[..., 0] = self._position_xy[:, None, 0] + cos_heading * points_b[..., 0] - sin_heading * points_b[..., 1]
-        points_w[..., 1] = self._position_xy[:, None, 1] + sin_heading * points_b[..., 0] + cos_heading * points_b[..., 1]
-
-        centers, slot_ids, active = self._template_data()
-        safe_slots = slot_ids.clamp_min(0)
-        delta = points_w.unsqueeze(2) - centers.unsqueeze(1)
-        half_extents = self._half_extents_xy[safe_slots].unsqueeze(1)
-        is_cylinder = (self._slot_type[safe_slots] == ObstacleSlotType.CYLINDER).unsqueeze(1)
-        cylinder_hit = torch.linalg.norm(delta, dim=-1) <= self._footprint_radius[safe_slots].unsqueeze(1)
-        box_hit = (torch.abs(delta[..., 0]) <= half_extents[..., 0]) & (torch.abs(delta[..., 1]) <= half_extents[..., 1])
-        hit = torch.where(is_cylinder, cylinder_hit, box_hit) & active.unsqueeze(1)
-        height = torch.where(hit, self._obstacle_heights[safe_slots].unsqueeze(1), torch.zeros_like(delta[..., 0])).amax(dim=2)
-        ny, nx = self.cfg.height_scan_shape
-        pooled = F.max_pool2d(height.reshape(self.num_envs, 1, ny, nx), kernel_size=2, stride=2).flatten(start_dim=1)
-        return torch.clamp(pooled, -1.5, 1.5)
-
-    def _pre_physics_step(self, actions: torch.Tensor):
-        lower = torch.tensor([item[0] for item in self.cfg.velocity_clip], device=self.device)
-        upper = torch.tensor([item[1] for item in self.cfg.velocity_clip], device=self.device)
-        self._actions = torch.clamp(actions, min=lower, max=upper)
-
-    def _apply_action(self):
-        # Ideal tracker: command is attained exactly at every physics tick.
-        self._body_velocity[:] = self._actions
-        heading_before = self._heading.clone()
-        cos_heading = torch.cos(heading_before)
-        sin_heading = torch.sin(heading_before)
-        self._position_xy[:, 0] += (cos_heading * self._actions[:, 0] - sin_heading * self._actions[:, 1]) * self.physics_dt
-        self._position_xy[:, 1] += (sin_heading * self._actions[:, 0] + cos_heading * self._actions[:, 1]) * self.physics_dt
-        self._heading = self._wrap_to_pi(self._heading + self._actions[:, 2] * self.physics_dt)
+        velocity_world = torch.stack(
+            (
+                cos_heading * self._command[:, 0] - sin_heading * self._command[:, 1],
+                sin_heading * self._command[:, 0] + cos_heading * self._command[:, 1],
+            ),
+            dim=-1,
+        )
+        self._position += velocity_world * self.physics_dt
 
     def _get_observations(self) -> dict[str, torch.Tensor]:
-        goal = self._goal_command()
-        base_ang_vel = torch.zeros_like(self._body_velocity)
-        base_ang_vel[:, 2] = self._body_velocity[:, 2] * 0.2
-        gravity = torch.zeros_like(self._body_velocity)
-        gravity[:, 2] = -1.0
-        policy = torch.cat((self._body_velocity, base_ang_vel, gravity, goal, self._last_actions, self._pooled_height_scan()), dim=1)
-        critic = torch.cat((policy, torch.full((self.num_envs, 1), self.cfg.base_height, device=self.device), torch.linalg.norm(goal[:, :2], dim=1, keepdim=True)), dim=1)
+        goal_delta = self._goal - self._position
+        cos_heading = torch.cos(self._heading)
+        sin_heading = torch.sin(self._heading)
+        goal_body = torch.stack(
+            (
+                cos_heading * goal_delta[:, 0] + sin_heading * goal_delta[:, 1],
+                -sin_heading * goal_delta[:, 0] + cos_heading * goal_delta[:, 1],
+            ),
+            dim=-1,
+        )
+        # Retains the old experiment's command semantics so this environment is
+        # reproducible with its historical checkpoints.
+        desired_heading = torch.atan2(goal_body[:, 1], goal_body[:, 0])
+        pose_command = torch.cat(
+            (
+                goal_body,
+                torch.zeros(self.num_envs, 1, device=self.device),
+                _wrap_to_pi(desired_heading - self._heading).unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        base_lin_vel = torch.cat((self._command[:, :2], torch.zeros(self.num_envs, 1, device=self.device)), dim=-1)
+        base_ang_vel = torch.stack(
+            (torch.zeros_like(self._heading), torch.zeros_like(self._heading), 0.2 * self._command[:, 2]), dim=-1
+        )
+        projected_gravity = torch.zeros(self.num_envs, 3, device=self.device)
+        projected_gravity[:, 2] = -1.0
+        policy = torch.cat(
+            (base_lin_vel, base_ang_vel, projected_gravity, pose_command, self._last_action, self._height_scan_pooled()),
+            dim=-1,
+        )
+        critic = torch.cat(
+            (
+                policy,
+                torch.full((self.num_envs, 1), self.cfg.tracker_height, device=self.device),
+                self._distance.unsqueeze(-1),
+            ),
+            dim=-1,
+        )
         return {"policy": policy, "critic": critic}
 
     def _get_rewards(self) -> torch.Tensor:
-        distance = torch.linalg.norm(self._goal_xy - self._position_xy, dim=1)
-        progress = self._previous_distance - distance
-        position_tracking = 1.0 - torch.tanh(distance / 0.1)
-        success = (distance < self.cfg.goal_success_radius).float()
-        obstacle_soft_zone = self._obstacle_soft_penalty(self._position_xy)
-        obstacle_collision = (
-            self._nearest_obstacle_surface_distance(self._position_xy) <= self.cfg.obstacle_termination_distance
-        ).float()
-        action_rate = torch.sum((self._actions - self._last_actions).square(), dim=1)
-        action_magnitude = torch.sum(self._actions.square(), dim=1)
-        rewards = {
-            # Match the physical task's fall termination penalty. The terminal
-            # collision is detected on the same transition in _get_dones.
-            "termination_penalty": -400.0 * obstacle_collision,
-            "position_progress": 2.0 * progress,
-            "position_tracking": 0.5 * position_tracking,
-            "success": 50.0 * success,
-            "obstacle_soft_zone": -6.0 * obstacle_soft_zone,
-            "action_rate": -0.05 * action_rate,
-            "action_magnitude": -0.01 * action_magnitude,
-        }
-        self._previous_distance[:] = distance
-        self._last_actions[:] = self._actions
-        for name, value in rewards.items():
-            self._episode_sums[name] += value * self.step_dt
-        return torch.stack(tuple(rewards.values()), dim=0).sum(dim=0) * self.step_dt
+        progress = self._previous_distance - self._distance
+        action_rate = torch.sum(torch.square(self._raw_action - self._last_action), dim=-1)
+        action_magnitude = torch.sum(torch.square(self._raw_action), dim=-1)
+        # Original V5 reward-manager weights multiplied by the 0.2 s high-level dt.
+        surface_distance = self._nearest_obstacle_clearance + self.cfg.tracker_radius
+        soft_zone = torch.clamp(1.0 - surface_distance / self.cfg.obstacle_soft_margin, min=0.0, max=1.0).square()
+        reward = self.physics_dt * (
+            2.0 * progress
+            + 0.5 * (1.0 - torch.tanh(self._distance / 0.1))
+            + 50.0 * self._success.float()
+            - 0.05 * action_rate
+            - 0.01 * action_magnitude
+            - 6.0 * soft_zone
+        )
+        # The ideal tracker cannot fall; collision is its counterpart to G1
+        # base-height/orientation termination.
+        reward -= self.physics_dt * 400.0 * (self._collision & ~self._success).float()
+        self._last_action.copy_(self._raw_action)
+        self._previous_distance.copy_(self._distance)
+        return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        success = torch.linalg.norm(self._goal_xy - self._position_xy, dim=1) < self.cfg.goal_success_radius
-        obstacle_collision = (
-            self._nearest_obstacle_surface_distance(self._position_xy) <= self.cfg.obstacle_termination_distance
-        )
+        self._distance = torch.linalg.vector_norm(self._goal - self._position, dim=-1)
+        obstacle_distance = torch.linalg.vector_norm(self._obstacles - self._position.unsqueeze(1), dim=-1)
+        self._nearest_obstacle_clearance = obstacle_distance.amin(dim=1) - self.cfg.obstacle_radius - self.cfg.tracker_radius
+        self._success = self._distance <= self.cfg.goal_radius
+        collision_distance = self.cfg.obstacle_radius + self.cfg.tracker_radius + self.cfg.termination_clearance
+        self._collision = torch.any(obstacle_distance <= collision_distance, dim=1)
+        self._out_of_bounds = torch.any(torch.abs(self._position) >= self.cfg.arena_half_extent, dim=1)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        return success | obstacle_collision, time_out
+        self.extras["log"] = {
+            "Episode/success": self._success.float().mean(),
+            "Episode/collision": self._collision.float().mean(),
+            "Metrics/distance_to_goal": self._distance.mean(),
+            "Metrics/nearest_obstacle_clearance": self._nearest_obstacle_clearance.mean(),
+        }
+        return (self._collision | self._out_of_bounds | self._success), time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
-        else:
-            env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
-
-        for name, values in self._episode_sums.items():
-            self.extras.setdefault("log", {})[f"Episode_Reward/{name}"] = values[env_ids].mean().item() / self.max_episode_length_s
-            values[env_ids] = 0.0
-
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         super()._reset_idx(env_ids)
-        self._position_xy[env_ids] = 0.0
-        self._heading[env_ids] = torch.empty(len(env_ids), device=self.device).uniform_(-math.pi, math.pi)
-        self._body_velocity[env_ids] = 0.0
-        self._actions[env_ids] = 0.0
-        self._last_actions[env_ids] = 0.0
-        self._template_id[env_ids] = env_ids % num_fixed_mixed_arena_templates()
-        self._sample_goals(env_ids)
-        self._previous_distance[env_ids] = torch.linalg.norm(self._goal_xy[env_ids] - self._position_xy[env_ids], dim=1)
+        if len(env_ids) == 0:
+            return
+
+        count = len(env_ids)
+        self._position[env_ids] = 0.0
+        self._heading[env_ids] = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
+        self._last_action[env_ids] = 0.0
+        self._raw_action[env_ids] = 0.0
+        self._command[env_ids] = 0.0
+
+        angle = torch.empty(count, device=self.device).uniform_(-math.pi, math.pi)
+        distance = torch.empty(count, device=self.device).uniform_(*self.cfg.goal_distance_range)
+        self._goal[env_ids] = torch.stack((distance * torch.cos(angle), distance * torch.sin(angle)), dim=-1)
+
+        low = -self.cfg.arena_half_extent + self.cfg.arena_margin
+        high = self.cfg.arena_half_extent - self.cfg.arena_margin
+        obstacles = torch.empty(count, self.cfg.num_obstacles, 2, device=self.device).uniform_(low, high)
+        reset_clearance = self.cfg.obstacle_radius + self.cfg.tracker_radius + 0.35
+        for _ in range(12):
+            near_start = torch.linalg.vector_norm(obstacles, dim=-1) < reset_clearance
+            near_goal = torch.linalg.vector_norm(obstacles - self._goal[env_ids].unsqueeze(1), dim=-1) < reset_clearance
+            invalid = near_start | near_goal
+            if not torch.any(invalid):
+                break
+            obstacles[invalid] = torch.empty(int(invalid.sum()), 2, device=self.device).uniform_(low, high)
+        self._obstacles[env_ids] = obstacles
+
+        self._distance[env_ids] = torch.linalg.vector_norm(self._goal[env_ids], dim=1)
+        self._previous_distance[env_ids] = self._distance[env_ids]
+        self._nearest_obstacle_clearance[env_ids] = torch.inf
+        self._success[env_ids] = False
+        self._collision[env_ids] = False
+        self._out_of_bounds[env_ids] = False
+
+    def _height_scan_pooled(self) -> torch.Tensor:
+        """V5-sign height scan: ground is +0.3 and tall obstacles are -1.5."""
+        relative_centers_w = self._obstacles - self._position.unsqueeze(1)
+        cos_heading = torch.cos(self._heading).unsqueeze(-1)
+        sin_heading = torch.sin(self._heading).unsqueeze(-1)
+        centers_b = torch.stack(
+            (
+                cos_heading * relative_centers_w[..., 0] + sin_heading * relative_centers_w[..., 1],
+                -sin_heading * relative_centers_w[..., 0] + cos_heading * relative_centers_w[..., 1],
+            ),
+            dim=-1,
+        )
+        delta = centers_b[:, :, None, None, :] - self._height_grid_points_b[None, None]
+        occupied = torch.any(torch.sum(delta.square(), dim=-1) <= self.cfg.obstacle_radius**2, dim=1)
+        heights = torch.where(
+            occupied,
+            torch.full_like(occupied, self._height_scan_obstacle, dtype=torch.float),
+            torch.full_like(occupied, self._height_scan_ground, dtype=torch.float),
+        )
+        return F.max_pool2d(heights.unsqueeze(1), kernel_size=2, stride=2).flatten(start_dim=1)

@@ -776,6 +776,26 @@ class NavigationV5CompactSingleGoalTerminationsCfg:
 
 
 @configclass
+class NavigationV5CompactSingleGoalNoLowLevelStateTerminationsCfg(
+    NavigationV5CompactSingleGoalTerminationsCfg
+):
+    """Use the same obstacle safety envelope as the ideal tracker."""
+
+    obstacle_proximity = DoneTerm(func=mdp.obstacle_proximity, params={"threshold": 0.1})
+
+
+@configclass
+class NavigationV5CompactSingleGoalNoLowLevelStateRewardsCfg(NavigationV5MixedObstacleRewardsCfg):
+    """Apply the physical fall penalty when entering the transfer safety envelope."""
+
+    termination_penalty = RewTerm(
+        func=mdp.is_terminated_term,
+        weight=-400.0,
+        params={"term_keys": ["base_height", "bad_orientation", "obstacle_proximity"]},
+    )
+
+
+@configclass
 class NavigationEnvCfg(ManagerBasedRLEnvCfg):
     """High-level G1 navigation task over a frozen low-level locomotion policy."""
 
@@ -894,6 +914,12 @@ class NavigationV5MixedObstacleEnvCfg_Compact_SingleGoal_NoLowLevelState(
 
     observations: NavigationV5CompactObservationsCfg_NoLowLevelState = (
         NavigationV5CompactObservationsCfg_NoLowLevelState()
+    )
+    rewards: NavigationV5CompactSingleGoalNoLowLevelStateRewardsCfg = (
+        NavigationV5CompactSingleGoalNoLowLevelStateRewardsCfg()
+    )
+    terminations: NavigationV5CompactSingleGoalNoLowLevelStateTerminationsCfg = (
+        NavigationV5CompactSingleGoalNoLowLevelStateTerminationsCfg()
     )
 
 
