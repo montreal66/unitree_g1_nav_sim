@@ -55,6 +55,7 @@ class KinematicNavigationEnvCfg(DirectRLEnvCfg):
     height_scan_size = (5.0, 3.0)
     height_scan_shape = (26, 42)
     obstacle_soft_margin = 0.4
+    obstacle_termination_distance = 0.1
 
 
 @configclass
@@ -126,7 +127,10 @@ class KinematicNavigationEnv(DirectRLEnv):
         ids = self._template_id if env_ids is None else self._template_id[env_ids]
         return self._template_centers[ids], self._template_slots[ids], self._template_active[ids]
 
-    def _obstacle_soft_penalty(self, query_xy: torch.Tensor, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def _nearest_obstacle_surface_distance(
+        self, query_xy: torch.Tensor, env_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Distance from the base projection to the nearest active obstacle surface."""
         centers, slot_ids, active = self._template_data(env_ids)
         safe_slots = slot_ids.clamp_min(0)
         delta = query_xy.unsqueeze(1) - centers
@@ -138,8 +142,13 @@ class KinematicNavigationEnv(DirectRLEnv):
         dy = torch.relu(torch.abs(delta[..., 1]) - half_extents[..., 1])
         box_distance = torch.sqrt(dx.square() + dy.square())
         surface_distance = torch.where(is_cylinder, cylinder_distance, box_distance)
+        return torch.where(active, surface_distance, torch.inf).amin(dim=1)
+
+    def _obstacle_soft_penalty(self, query_xy: torch.Tensor, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Match the physical task's soft-zone penalty exactly."""
+        surface_distance = self._nearest_obstacle_surface_distance(query_xy, env_ids)
         normalized = torch.clamp(1.0 - surface_distance / self.cfg.obstacle_soft_margin, min=0.0, max=1.0).square()
-        return torch.max(normalized * active.float(), dim=1).values
+        return normalized
 
     def _is_goal_free(self, goal_xy: torch.Tensor, env_ids: torch.Tensor) -> torch.Tensor:
         centers, slot_ids, active = self._template_data(env_ids)
@@ -253,8 +262,11 @@ class KinematicNavigationEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         success = torch.linalg.norm(self._goal_xy - self._position_xy, dim=1) < self.cfg.goal_success_radius
+        obstacle_collision = (
+            self._nearest_obstacle_surface_distance(self._position_xy) <= self.cfg.obstacle_termination_distance
+        )
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        return success, time_out
+        return success | obstacle_collision, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
